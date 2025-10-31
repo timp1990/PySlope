@@ -249,6 +249,9 @@ class Slope:
         angle of slope (only used if length None), by default 30
     length : float, optional
         length of slope in metres, by default None
+    uphill_angle : int, optional
+        angle of uphill surface in degrees from horizontal (0 = flat, positive = upward slope).
+        If None, uphill surface is flat (default behavior), by default None
 
     Examples
     ------------
@@ -260,13 +263,15 @@ class Slope:
     Slope: 1V : 2H
     >>> Slope()
     Slope: 1V : 1.732H
+    >>> Slope(height = 3, angle = 30, uphill_angle = 5)
+    Slope: 3V : 5.196H
     """
 
     def __repr__(self):
         return f"Slope: {round(self._height, 3)}V : {round(self._length, 3)}H"
 
     def __init__(
-        self, height: float = 1, angle: int = 30, length: float = None
+        self, height: float = 1, angle: int = 30, length: float = None, uphill_angle: int = None
     ):
         # initialise empty properties used in other components of class
         self._materials = []
@@ -283,7 +288,7 @@ class Slope:
 
         # intialise options
         self.update_boundary_options(MIN_EXT_H=6, MIN_EXT_L=10)
-        self.set_external_boundary(height=height, angle=angle, length=length)
+        self.set_external_boundary(height=height, angle=angle, length=length, uphill_angle=uphill_angle)
         self.update_analysis_options(
             slices=25,
             iterations=1000,
@@ -313,7 +318,7 @@ class Slope:
         }
 
     def set_external_boundary(
-        self, height: float = 1, angle: int = 30, length: float = None
+        self, height: float = 1, angle: int = 30, length: float = None, uphill_angle: int = None
     ):
         """Set external boundary for model.
 
@@ -327,6 +332,9 @@ class Slope:
         length : float, optional
             length of slope in metres (may be left as none if slope
             is instead expressed by angle of slope), by default None
+        uphill_angle : int, optional
+            angle of uphill surface in degrees from horizontal (0 = flat, positive = upward slope).
+            If None, uphill surface is flat (default behavior), by default None
 
         Raises
         ------
@@ -341,6 +349,9 @@ class Slope:
         >>> a.set_external_boundary(height = 2, length = 0.5)
         >>> a
         Slope: 2V : 0.5H
+        >>> a.set_external_boundary(height = 2, length = 0.5, uphill_angle = 5)
+        >>> a
+        Slope: 2V : 0.5H
         """
         # validate inputs
         if height is not None:
@@ -350,6 +361,10 @@ class Slope:
             data_validation.assert_range(angle, "angle", 0, 90, not_low=True)
         if length is not None:
             data_validation.assert_positive_number(length, "length")
+        if uphill_angle is not None:
+            # uphill angle can be negative (downward) or positive (upward)
+            # reasonable range: -45 to 45 degrees
+            data_validation.assert_range(uphill_angle, "uphill_angle", -45, 45)
 
         # if angle assigned instead of length work out the model length
         if length is None:
@@ -373,10 +388,35 @@ class Slope:
         top = (dx, tot_h)
         bot = (dx + length, tot_h - height)
 
+        # calculate uphill surface start point if uphill_angle is specified
+        if uphill_angle is not None and uphill_angle != 0:
+            # Calculate how far back the uphill surface should start
+            # to reach the same y-level as the slope top
+            uphill_length = dx  # Default to dx, but can be extended
+            uphill_gradient = tan(radians(uphill_angle))
+            uphill_start_y = tot_h - uphill_length * uphill_gradient
+            
+            # Ensure uphill start is above the bottom of the model
+            uphill_start_y = max(uphill_start_y, 0)
+            # Adjust uphill_length if needed
+            if uphill_start_y < tot_h:
+                uphill_length = (tot_h - uphill_start_y) / uphill_gradient
+            
+            uphill_start = (0, uphill_start_y)
+            self._uphill_angle = uphill_angle
+            self._uphill_gradient = uphill_gradient
+            self._uphill_start = uphill_start
+        else:
+            # Flat uphill surface (default behavior)
+            uphill_start = (0, tot_h)
+            self._uphill_angle = None
+            self._uphill_gradient = 0
+            self._uphill_start = uphill_start
+
         # set up external boundary as list of coordinates
         self._external_boundary = [
             (0, 0),
-            (0, top[1]),
+            uphill_start,
             top,
             bot,
             (tot_l, bot[1]),
@@ -916,8 +956,9 @@ class Slope:
         # if the external boundary has been set this call is after init.
         # Can update the boundary. otherwise will get an error
         if self._external_boundary is not None:
+            uphill_angle = getattr(self, '_uphill_angle', None)
             self.set_external_boundary(
-                height=self._height, length=self._length
+                height=self._height, length=self._length, uphill_angle=uphill_angle
             )
 
         # reset results
@@ -1377,15 +1418,30 @@ class Slope:
         ) = self._bot_coord
         grad = self._gradient
 
-        slice_yt = np.where(
-            slice_x <= top_x,
-            top_y,
-            np.where(
-                slice_x >= bot_x,
-                bot_y,
-                top_y - (slice_x - top_x) * grad,
-            ),
-        )
+        # Handle angled uphill surface
+        if self._uphill_angle is not None and self._uphill_angle != 0:
+            # For slices on uphill surface, calculate y based on uphill gradient
+            uphill_y = self._uphill_start[1] + slice_x * self._uphill_gradient
+            slice_yt = np.where(
+                slice_x <= top_x,
+                uphill_y,
+                np.where(
+                    slice_x >= bot_x,
+                    bot_y,
+                    top_y - (slice_x - top_x) * grad,
+                ),
+            )
+        else:
+            # Flat uphill surface (original behavior)
+            slice_yt = np.where(
+                slice_x <= top_x,
+                top_y,
+                np.where(
+                    slice_x >= bot_x,
+                    bot_y,
+                    top_y - (slice_x - top_x) * grad,
+                ),
+            )
 
         # Ensure top ≥ bottom
         slice_yt = np.maximum(
@@ -1605,15 +1661,30 @@ class Slope:
         slope_grad = self._gradient
 
         # Top of the slice (depends on position along slope)
-        slice_y_top = np.where(
-            slice_x <= top_x,
-            top_y,
-            np.where(
-                slice_x >= bot_x,
-                bot_y,
-                top_y - (slice_x - top_x) * slope_grad,
-            ),
-        )
+        # Handle angled uphill surface
+        if self._uphill_angle is not None and self._uphill_angle != 0:
+            # For slices on uphill surface, calculate y based on uphill gradient
+            uphill_y = self._uphill_start[1] + slice_x * self._uphill_gradient
+            slice_y_top = np.where(
+                slice_x <= top_x,
+                uphill_y,
+                np.where(
+                    slice_x >= bot_x,
+                    bot_y,
+                    top_y - (slice_x - top_x) * slope_grad,
+                ),
+            )
+        else:
+            # Flat uphill surface (original behavior)
+            slice_y_top = np.where(
+                slice_x <= top_x,
+                top_y,
+                np.where(
+                    slice_x >= bot_x,
+                    bot_y,
+                    top_y - (slice_x - top_x) * slope_grad,
+                ),
+            )
         slice_y_top = np.maximum(
             slice_y_top,
             slice_y_bottom,
@@ -1862,8 +1933,10 @@ class Slope:
 
         i_list = []
 
+        # Use uphill start point instead of (0, top[1]) for angled surfaces
+        uphill_start = self._uphill_start if (self._uphill_angle is not None and self._uphill_angle != 0) else (0, self._top_coord[1])
         top_intersection = utilities.cirle_line_intersection(
-            (0, self._top_coord[1]), self._top_coord, c_x, c_y, radius
+            uphill_start, self._top_coord, c_x, c_y, radius
         )
 
         # only care about left of circle for top intersection
@@ -2068,12 +2141,17 @@ class Slope:
         """return y coordinate of intersection with boundary for a given x"""
         if x < 0 or x > self._external_length:
             return None
-        # y is below the bottom of the slope
+        # y is on the uphill surface (before slope top)
         elif x <= self._top_coord[0]:
-            return self._top_coord[1]
+            if self._uphill_angle is not None and self._uphill_angle != 0:
+                # Calculate y based on angled uphill surface
+                return self._uphill_start[1] + x * self._uphill_gradient
+            else:
+                # Flat uphill surface
+                return self._top_coord[1]
         elif x >= self._bot_coord[0]:
             return self._bot_coord[1]
-        # y is above the bottom of the slope
+        # y is on the slope face (between top and bottom)
         else:
             return (
                 self._top_coord[1] - (x - self._top_coord[0]) * self._gradient
@@ -2085,8 +2163,8 @@ class Slope:
         if y < self._bot_coord[1]:
             return self._external_length
 
-        # y is above the bottom of the slope
-        elif y < self._external_height:
+        # y is on the slope face (between top and bottom)
+        elif y < self._top_coord[1]:
             return (
                 self._top_coord[0] + (self._top_coord[1] - y) / self._gradient
             )
@@ -2096,6 +2174,26 @@ class Slope:
 
         elif y == self._top_coord[1]:
             return self._top_coord[0]
+
+        # y is on the uphill surface (above slope top)
+        elif y <= self._external_height:
+            if self._uphill_angle is not None and self._uphill_angle != 0:
+                # Calculate x based on angled uphill surface
+                if self._uphill_gradient != 0:
+                    x = (y - self._uphill_start[1]) / self._uphill_gradient
+                    # Ensure x is within valid range
+                    if x < 0:
+                        return 0
+                    elif x > self._top_coord[0]:
+                        return self._top_coord[0]
+                    return x
+                else:
+                    return self._top_coord[0]
+            else:
+                # Flat uphill surface - any y at top height maps to x at slope top
+                if y == self._top_coord[1]:
+                    return self._top_coord[0]
+                return None
 
         else:
             return None
@@ -2306,13 +2404,13 @@ class Slope:
 
                 # 65 long list but the last half of points are for the top half of
                 # circle and so will never actually be required.
-                for i in range(len(x)):
+                for j in range(len(x)):
                     # x coordinate should be between left and right
                     # note for y, should be less than left y but can stoop
-                    # below right i
-                    if x[i] <= r_c[0] and x[i] >= l_c[0] and y[i] <= l_c[1]:
-                        x_.append(x[i])
-                        y_.append(y[i])
+                    # below right j
+                    if x[j] <= r_c[0] and x[j] >= l_c[0] and y[j] <= l_c[1]:
+                        x_.append(x[j])
+                        y_.append(y[j])
 
                 x_ = [l_c[0]] + x_ + [r_c[0]]
                 y_ = [l_c[1]] + y_ + [r_c[1]]

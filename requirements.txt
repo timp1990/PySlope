@@ -1,12 +1,11 @@
-colour
-plotly
-tqdm
-gunicorn
-django
-whitenoise
-dj-database-url
-psycopg2-binary
-kaleido
-pytest
-pytest-cov
-numpy
+# Core PySlope dependencies
+colour>=0.1.5
+plotly>=5.0.0
+numpy>=1.20.0
+tqdm>=4.60.0
+kaleido>=0.2.1
+
+# GUI-specific dependencies
+Pillow>=9.0.0
+matplotlib>=3.5.0
+python-docx>=0.8.11
